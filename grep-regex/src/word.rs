@@ -55,6 +55,11 @@ impl WordMatcher {
         }
         Ok(WordMatcher { regex, names, locs })
     }
+
+    /// Return the underlying regex used by this matcher.
+    pub fn regex(&self) -> &Regex {
+        &self.regex
+    }
 }
 
 impl Matcher for WordMatcher {
@@ -98,7 +103,9 @@ impl Matcher for WordMatcher {
         at: usize,
         caps: &mut RegexCaptures,
     ) -> Result<bool, NoError> {
-        let r = self.regex.captures_read_at(caps.locations(), haystack, at);
+        let r = self.regex.captures_read_at(
+            caps.locations_mut(), haystack, at,
+        );
         Ok(r.is_some())
     }
 

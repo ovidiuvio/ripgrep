@@ -72,7 +72,7 @@ rgtest!(f7_stdin, |dir: Dir, mut cmd: TestCommand| {
 sherlock:For the Doctor Watsons of this world, as opposed to the Sherlock
 sherlock:be, to a very large extent, the result of luck. Sherlock Holmes
 ";
-    eqnice!(expected, cmd.arg("-f-").pipe("Sherlock"));
+    eqnice!(expected, cmd.arg("-f-").pipe(b"Sherlock"));
 });
 
 // See: https://github.com/BurntSushi/ripgrep/issues/20
@@ -630,6 +630,41 @@ rgtest!(f993_null_data, |dir: Dir, mut cmd: TestCommand| {
     eqnice!(expected, cmd.stdout());
 });
 
+// See: https://github.com/BurntSushi/ripgrep/issues/1078
+//
+// N.B. There are many more tests in the grep-printer crate.
+rgtest!(f1078_max_columns_preview1, |dir: Dir, mut cmd: TestCommand| {
+    dir.create("sherlock", SHERLOCK);
+    cmd.args(&[
+        "-M46", "--max-columns-preview",
+        "exhibited|dusted|has to have it",
+    ]);
+
+    let expected = "\
+sherlock:but Doctor Watson has to have it taken out for [... omitted end of long line]
+sherlock:and exhibited clearly, with a label attached.
+";
+    eqnice!(expected, cmd.stdout());
+});
+
+rgtest!(f1078_max_columns_preview2, |dir: Dir, mut cmd: TestCommand| {
+    dir.create("sherlock", SHERLOCK);
+    cmd.args(&[
+        "-M43", "--max-columns-preview",
+        // Doing a replacement forces ripgrep to show the number of remaining
+        // matches. Normally, this happens by default when printing a tty with
+        // colors.
+        "-rxxx",
+        "exhibited|dusted|has to have it",
+    ]);
+
+    let expected = "\
+sherlock:but Doctor Watson xxx taken out for him and [... 1 more match]
+sherlock:and xxx clearly, with a label attached.
+";
+    eqnice!(expected, cmd.stdout());
+});
+
 // See: https://github.com/BurntSushi/ripgrep/issues/1138
 rgtest!(f1138_no_ignore_dot, |dir: Dir, mut cmd: TestCommand| {
     dir.create_dir(".git");
@@ -644,4 +679,51 @@ rgtest!(f1138_no_ignore_dot, |dir: Dir, mut cmd: TestCommand| {
     eqnice!("quux\n", cmd.stdout());
     eqnice!("bar\nquux\n", cmd.arg("--no-ignore-dot").stdout());
     eqnice!("bar\n", cmd.arg("--ignore-file").arg(".fzf-ignore").stdout());
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/1155
+rgtest!(f1155_auto_hybrid_regex, |dir: Dir, mut cmd: TestCommand| {
+    // No sense in testing a hybrid regex engine with only one engine!
+    if !dir.is_pcre2() {
+        return;
+    }
+
+    dir.create("sherlock", SHERLOCK);
+    cmd.arg("--no-pcre2").arg("--auto-hybrid-regex").arg(r"(?<=the )Sherlock");
+
+    let expected = "\
+sherlock:For the Doctor Watsons of this world, as opposed to the Sherlock
+";
+    eqnice!(expected, cmd.stdout());
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/1207
+//
+// Tests if without encoding 'none' flag null bytes are consumed by automatic
+// encoding detection.
+rgtest!(f1207_auto_encoding, |dir: Dir, mut cmd: TestCommand| {
+    dir.create_bytes(
+        "foo",
+        b"\xFF\xFE\x00\x62"
+    );
+    cmd.arg("-a").arg("\\x00").arg("foo");
+    cmd.assert_exit_code(1);
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/1207
+//
+// Tests if encoding 'none' flag does treat file as raw bytes
+rgtest!(f1207_ignore_encoding, |dir: Dir, mut cmd: TestCommand| {
+    // PCRE2 chokes on this test because it can't search invalid non-UTF-8
+    // and the point of this test is to search raw UTF-16.
+    if dir.is_pcre2() {
+        return;
+    }
+
+    dir.create_bytes(
+        "foo",
+        b"\xFF\xFE\x00\x62"
+    );
+    cmd.arg("--encoding").arg("none").arg("-a").arg("\\x00").arg("foo");
+    eqnice!("\u{FFFD}\u{FFFD}\x00b\n", cmd.stdout());
 });

@@ -27,6 +27,9 @@ configuration file. The file can specify one shell argument per line. Lines
 starting with '#' are ignored. For more details, see the man page or the
 README.
 
+Tip: to disable all smart filtering and make ripgrep behave a bit more like
+classical grep, use 'rg -uuu'.
+
 Project home page: https://github.com/BurntSushi/ripgrep
 
 Use -h for short descriptions and --help for more details.";
@@ -544,7 +547,9 @@ pub fn all_args_and_flags() -> Vec<RGArg> {
     // flags are hidden and merely mentioned in the docs of the corresponding
     // "positive" flag.
     flag_after_context(&mut args);
+    flag_auto_hybrid_regex(&mut args);
     flag_before_context(&mut args);
+    flag_binary(&mut args);
     flag_block_buffered(&mut args);
     flag_byte_offset(&mut args);
     flag_case_sensitive(&mut args);
@@ -578,6 +583,7 @@ pub fn all_args_and_flags() -> Vec<RGArg> {
     flag_line_number(&mut args);
     flag_line_regexp(&mut args);
     flag_max_columns(&mut args);
+    flag_max_columns_preview(&mut args);
     flag_max_count(&mut args);
     flag_max_depth(&mut args);
     flag_max_filesize(&mut args);
@@ -600,6 +606,7 @@ pub fn all_args_and_flags() -> Vec<RGArg> {
     flag_path_separator(&mut args);
     flag_passthru(&mut args);
     flag_pcre2(&mut args);
+    flag_pcre2_version(&mut args);
     flag_pre(&mut args);
     flag_pre_glob(&mut args);
     flag_pretty(&mut args);
@@ -646,7 +653,7 @@ will be provided. Namely, the following is equivalent to the above:
     let arg = RGArg::positional("pattern", "PATTERN")
         .help(SHORT).long_help(LONG)
         .required_unless(&[
-            "file", "files", "regexp", "type-list",
+            "file", "files", "regexp", "type-list", "pcre2-version",
         ]);
     args.push(arg);
 }
@@ -677,6 +684,50 @@ This overrides the --context flag.
     args.push(arg);
 }
 
+fn flag_auto_hybrid_regex(args: &mut Vec<RGArg>) {
+    const SHORT: &str = "Dynamically use PCRE2 if necessary.";
+    const LONG: &str = long!("\
+When this flag is used, ripgrep will dynamically choose between supported regex
+engines depending on the features used in a pattern. When ripgrep chooses a
+regex engine, it applies that choice for every regex provided to ripgrep (e.g.,
+via multiple -e/--regexp or -f/--file flags).
+
+As an example of how this flag might behave, ripgrep will attempt to use
+its default finite automata based regex engine whenever the pattern can be
+successfully compiled with that regex engine. If PCRE2 is enabled and if the
+pattern given could not be compiled with the default regex engine, then PCRE2
+will be automatically used for searching. If PCRE2 isn't available, then this
+flag has no effect because there is only one regex engine to choose from.
+
+In the future, ripgrep may adjust its heuristics for how it decides which
+regex engine to use. In general, the heuristics will be limited to a static
+analysis of the patterns, and not to any specific runtime behavior observed
+while searching files.
+
+The primary downside of using this flag is that it may not always be obvious
+which regex engine ripgrep uses, and thus, the match semantics or performance
+profile of ripgrep may subtly and unexpectedly change. However, in many cases,
+all regex engines will agree on what constitutes a match and it can be nice
+to transparently support more advanced regex features like look-around and
+backreferences without explicitly needing to enable them.
+
+This flag can be disabled with --no-auto-hybrid-regex.
+");
+    let arg = RGArg::switch("auto-hybrid-regex")
+        .help(SHORT).long_help(LONG)
+        .overrides("no-auto-hybrid-regex")
+        .overrides("pcre2")
+        .overrides("no-pcre2");
+    args.push(arg);
+
+    let arg = RGArg::switch("no-auto-hybrid-regex")
+        .hidden()
+        .overrides("auto-hybrid-regex")
+        .overrides("pcre2")
+        .overrides("no-pcre2");
+    args.push(arg);
+}
+
 fn flag_before_context(args: &mut Vec<RGArg>) {
     const SHORT: &str = "Show NUM lines before each match.";
     const LONG: &str = long!("\
@@ -688,6 +739,55 @@ This overrides the --context flag.
         .help(SHORT).long_help(LONG)
         .number()
         .overrides("context");
+    args.push(arg);
+}
+
+fn flag_binary(args: &mut Vec<RGArg>) {
+    const SHORT: &str = "Search binary files.";
+    const LONG: &str = long!("\
+Enabling this flag will cause ripgrep to search binary files. By default,
+ripgrep attempts to automatically skip binary files in order to improve the
+relevance of results and make the search faster.
+
+Binary files are heuristically detected based on whether they contain a NUL
+byte or not. By default (without this flag set), once a NUL byte is seen,
+ripgrep will stop searching the file. Usually, NUL bytes occur in the beginning
+of most binary files. If a NUL byte occurs after a match, then ripgrep will
+still stop searching the rest of the file, but a warning will be printed.
+
+In contrast, when this flag is provided, ripgrep will continue searching a file
+even if a NUL byte is found. In particular, if a NUL byte is found then ripgrep
+will continue searching until either a match is found or the end of the file is
+reached, whichever comes sooner. If a match is found, then ripgrep will stop
+and print a warning saying that the search stopped prematurely.
+
+If you want ripgrep to search a file without any special NUL byte handling at
+all (and potentially print binary data to stdout), then you should use the
+'-a/--text' flag.
+
+The '--binary' flag is a flag for controlling ripgrep's automatic filtering
+mechanism. As such, it does not need to be used when searching a file
+explicitly or when searching stdin. That is, it is only applicable when
+recursively searching a directory.
+
+Note that when the '-u/--unrestricted' flag is provided for a third time, then
+this flag is automatically enabled.
+
+This flag can be disabled with '--no-binary'. It overrides the '-a/--text'
+flag.
+");
+    let arg = RGArg::switch("binary")
+        .help(SHORT).long_help(LONG)
+        .overrides("no-binary")
+        .overrides("text")
+        .overrides("no-text");
+    args.push(arg);
+
+    let arg = RGArg::switch("no-binary")
+        .hidden()
+        .overrides("binary")
+        .overrides("text")
+        .overrides("no-text");
     args.push(arg);
 }
 
@@ -984,7 +1084,9 @@ Specify the text encoding that ripgrep will use on all files searched. The
 default value is 'auto', which will cause ripgrep to do a best effort automatic
 detection of encoding on a per-file basis. Automatic detection in this case
 only applies to files that begin with a UTF-8 or UTF-16 byte-order mark (BOM).
-No other automatic detection is performend.
+No other automatic detection is performed. One can also specify 'none' which
+will then completely disable BOM sniffing and always result in searching the
+raw bytes, including a BOM if it's present, regardless of its encoding.
 
 Other supported values can be found in the list of labels here:
 https://encoding.spec.whatwg.org/#concept-encoding-get
@@ -1385,6 +1487,30 @@ When this flag is omitted or is set to 0, then it has no effect.
     let arg = RGArg::flag("max-columns", "NUM").short("M")
         .help(SHORT).long_help(LONG)
         .number();
+    args.push(arg);
+}
+
+fn flag_max_columns_preview(args: &mut Vec<RGArg>) {
+    const SHORT: &str = "Print a preview for lines exceeding the limit.";
+    const LONG: &str = long!("\
+When the '--max-columns' flag is used, ripgrep will by default completely
+replace any line that is too long with a message indicating that a matching
+line was removed. When this flag is combined with '--max-columns', a preview
+of the line (corresponding to the limit size) is shown instead, where the part
+of the line exceeding the limit is not shown.
+
+If the '--max-columns' flag is not set, then this has no effect.
+
+This flag can be disabled with '--no-max-columns-preview'.
+");
+    let arg = RGArg::switch("max-columns-preview")
+        .help(SHORT).long_help(LONG)
+        .overrides("no-max-columns-preview");
+    args.push(arg);
+
+    let arg = RGArg::switch("no-max-columns-preview")
+        .hidden()
+        .overrides("max-columns-preview");
     args.push(arg);
 }
 
@@ -1857,12 +1983,28 @@ This flag can be disabled with --no-pcre2.
 ");
     let arg = RGArg::switch("pcre2").short("P")
         .help(SHORT).long_help(LONG)
-        .overrides("no-pcre2");
+        .overrides("no-pcre2")
+        .overrides("auto-hybrid-regex")
+        .overrides("no-auto-hybrid-regex");
     args.push(arg);
 
     let arg = RGArg::switch("no-pcre2")
         .hidden()
-        .overrides("pcre2");
+        .overrides("pcre2")
+        .overrides("auto-hybrid-regex")
+        .overrides("no-auto-hybrid-regex");
+    args.push(arg);
+}
+
+fn flag_pcre2_version(args: &mut Vec<RGArg>) {
+    const SHORT: &str = "Print the version of PCRE2 that ripgrep uses.";
+    const LONG: &str = long!("\
+When this flag is present, ripgrep will print the version of PCRE2 in use,
+along with other information, and then exit. If PCRE2 is not available, then
+ripgrep will print an error message and exit with an error code.
+");
+    let arg = RGArg::switch("pcre2-version")
+        .help(SHORT).long_help(LONG);
     args.push(arg);
 }
 
@@ -1872,12 +2014,13 @@ fn flag_pre(args: &mut Vec<RGArg>) {
 For each input FILE, search the standard output of COMMAND FILE rather than the
 contents of FILE. This option expects the COMMAND program to either be an
 absolute path or to be available in your PATH. Either an empty string COMMAND
-or the `--no-pre` flag will disable this behavior.
+or the '--no-pre' flag will disable this behavior.
 
     WARNING: When this flag is set, ripgrep will unconditionally spawn a
     process for every file that is searched. Therefore, this can incur an
     unnecessarily large performance penalty if you don't otherwise need the
-    flexibility offered by this flag.
+    flexibility offered by this flag. One possible mitigation to this is to use
+    the '--pre-glob' flag to limit which files a preprocessor is run with.
 
 A preprocessor is not run when ripgrep is searching stdin.
 
@@ -2206,20 +2349,23 @@ escape codes to be printed that alter the behavior of your terminal.
 When binary file detection is enabled it is imperfect. In general, it uses
 a simple heuristic. If a NUL byte is seen during search, then the file is
 considered binary and search stops (unless this flag is present).
+Alternatively, if the '--binary' flag is used, then ripgrep will only quit
+when it sees a NUL byte after it sees a match (or searches the entire file).
 
-Note that when the `-u/--unrestricted` flag is provided for a third time, then
-this flag is automatically enabled.
-
-This flag can be disabled with --no-text.
+This flag can be disabled with '--no-text'. It overrides the '--binary' flag.
 ");
     let arg = RGArg::switch("text").short("a")
         .help(SHORT).long_help(LONG)
-        .overrides("no-text");
+        .overrides("no-text")
+        .overrides("binary")
+        .overrides("no-binary");
     args.push(arg);
 
     let arg = RGArg::switch("no-text")
         .hidden()
-        .overrides("text");
+        .overrides("text")
+        .overrides("binary")
+        .overrides("no-binary");
     args.push(arg);
 }
 
@@ -2348,8 +2494,7 @@ Reduce the level of \"smart\" searching. A single -u won't respect .gitignore
 (etc.) files. Two -u flags will additionally search hidden files and
 directories. Three -u flags will additionally search binary files.
 
--uu is roughly equivalent to grep -r and -uuu is roughly equivalent to grep -a
--r.
+'rg -uuu' is roughly equivalent to 'grep -r'.
 ");
     let arg = RGArg::switch("unrestricted").short("u")
         .help(SHORT).long_help(LONG)
@@ -2391,7 +2536,7 @@ ripgrep is explicitly instructed to search one file or stdin.
 
 This flag overrides --with-filename.
 ");
-    let arg = RGArg::switch("no-filename")
+    let arg = RGArg::switch("no-filename").short("I")
         .help(NO_SHORT).long_help(NO_LONG)
         .overrides("with-filename");
     args.push(arg);

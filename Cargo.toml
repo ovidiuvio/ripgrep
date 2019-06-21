@@ -1,6 +1,6 @@
 [package]
 name = "ripgrep"
-version = "0.10.0"  #:version
+version = "11.0.1"  #:version
 authors = ["Andrew Gallant <jamslam@gmail.com>"]
 description = """
 ripgrep is a line-oriented search tool that recursively searches your current
@@ -46,8 +46,9 @@ members = [
 ]
 
 [dependencies]
-grep = { version = "0.2.3", path = "grep" }
-ignore = { version = "0.4.4", path = "ignore" }
+bstr = "0.1.2"
+grep = { version = "0.2.4", path = "grep" }
+ignore = { version = "0.4.7", path = "ignore" }
 lazy_static = "1.1.0"
 log = "0.4.5"
 num_cpus = "1.8.0"
@@ -59,6 +60,9 @@ termcolor = "1.0.3"
 version = "2.32.0"
 default-features = false
 features = ["suggestions"]
+
+[target.'cfg(all(target_env = "musl", target_pointer_width = "64"))'.dependencies.jemallocator]
+version = "0.3.0"
 
 [build-dependencies]
 lazy_static = "1.1.0"

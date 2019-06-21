@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use bstr::BStr;
 use grep_matcher::{Match, Matcher};
 use grep_searcher::{
     LineStep, Searcher,
@@ -16,10 +17,7 @@ use termcolor::{ColorSpec, NoColor, WriteColor};
 use color::ColorSpecs;
 use counter::CounterWriter;
 use stats::Stats;
-use util::{
-    PrinterPath, Replacer, Sunk,
-    trim_ascii_prefix, trim_ascii_prefix_range,
-};
+use util::{PrinterPath, Replacer, Sunk, trim_ascii_prefix};
 
 /// The configuration for the standard printer.
 ///
@@ -36,6 +34,7 @@ struct Config {
     per_match: bool,
     replacement: Arc<Option<Vec<u8>>>,
     max_columns: Option<u64>,
+    max_columns_preview: bool,
     max_matches: Option<u64>,
     column: bool,
     byte_offset: bool,
@@ -59,6 +58,7 @@ impl Default for Config {
             per_match: false,
             replacement: Arc::new(None),
             max_columns: None,
+            max_columns_preview: false,
             max_matches: None,
             column: false,
             byte_offset: false,
@@ -260,6 +260,21 @@ impl StandardBuilder {
     /// contextual line is printed regardless of how long it is.
     pub fn max_columns(&mut self, limit: Option<u64>) -> &mut StandardBuilder {
         self.config.max_columns = limit;
+        self
+    }
+
+    /// When enabled, if a line is found to be over the configured maximum
+    /// column limit (measured in terms of bytes), then a preview of the long
+    /// line will be printed instead.
+    ///
+    /// The preview will correspond to the first `N` *grapheme clusters* of
+    /// the line, where `N` is the limit configured by `max_columns`.
+    ///
+    /// If no limit is set, then enabling this has no effect.
+    ///
+    /// This is disabled by default.
+    pub fn max_columns_preview(&mut self, yes: bool) -> &mut StandardBuilder {
+        self.config.max_columns_preview = yes;
         self
     }
 
@@ -743,6 +758,11 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for StandardSink<'p, 's, M, W> {
             stats.add_matches(self.standard.matches.len() as u64);
             stats.add_matched_lines(mat.lines().count() as u64);
         }
+        if searcher.binary_detection().convert_byte().is_some() {
+            if self.binary_byte_offset.is_some() {
+                return Ok(false);
+            }
+        }
 
         StandardImpl::from_match(searcher, self, mat).sink()?;
         Ok(!self.should_quit())
@@ -764,6 +784,12 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for StandardSink<'p, 's, M, W> {
             self.record_matches(ctx.bytes())?;
             self.replace(ctx.bytes())?;
         }
+        if searcher.binary_detection().convert_byte().is_some() {
+            if self.binary_byte_offset.is_some() {
+                return Ok(false);
+            }
+        }
+
         StandardImpl::from_context(searcher, self, ctx).sink()?;
         Ok(!self.should_quit())
     }
@@ -773,6 +799,15 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for StandardSink<'p, 's, M, W> {
         searcher: &Searcher,
     ) -> Result<bool, io::Error> {
         StandardImpl::new(searcher, self).write_context_separator()?;
+        Ok(true)
+    }
+
+    fn binary_data(
+        &mut self,
+        _searcher: &Searcher,
+        binary_byte_offset: u64,
+    ) -> Result<bool, io::Error> {
+        self.binary_byte_offset = Some(binary_byte_offset);
         Ok(true)
     }
 
@@ -793,10 +828,12 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for StandardSink<'p, 's, M, W> {
 
     fn finish(
         &mut self,
-        _searcher: &Searcher,
+        searcher: &Searcher,
         finish: &SinkFinish,
     ) -> Result<(), io::Error> {
-        self.binary_byte_offset = finish.binary_byte_offset();
+        if let Some(offset) = self.binary_byte_offset {
+            StandardImpl::new(searcher, self).write_binary_message(offset)?;
+        }
         if let Some(stats) = self.stats.as_mut() {
             stats.add_elapsed(self.start_time.elapsed());
             stats.add_searches(1);
@@ -992,7 +1029,7 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         let mut count = 0;
         let mut stepper = LineStep::new(line_term, 0, bytes.len());
         while let Some((start, end)) = stepper.next(bytes) {
-            let mut line = Match::new(start, end);
+            let line = Match::new(start, end);
             self.write_prelude(
                 self.sunk.absolute_byte_offset() + line.start() as u64,
                 self.sunk.line_number().map(|n| n + count),
@@ -1000,43 +1037,11 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
             )?;
             count += 1;
             if self.exceeds_max_columns(&bytes[line]) {
-                self.write_exceeded_line()?;
-                continue;
+                self.write_exceeded_line(bytes, line, matches, &mut midx)?;
+            } else {
+                self.write_colored_matches(bytes, line, matches, &mut midx)?;
+                self.write_line_term()?;
             }
-            if self.has_line_terminator(&bytes[line]) {
-                line = line.with_end(line.end() - 1);
-            }
-            if self.config().trim_ascii {
-                line = self.trim_ascii_prefix_range(bytes, line);
-            }
-
-            while !line.is_empty() {
-                if matches[midx].end() <= line.start() {
-                    if midx + 1 < matches.len() {
-                        midx += 1;
-                        continue;
-                    } else {
-                        self.end_color_match()?;
-                        self.write(&bytes[line])?;
-                        break;
-                    }
-                }
-                let m = matches[midx];
-
-                if line.start() < m.start() {
-                    let upto = cmp::min(line.end(), m.start());
-                    self.end_color_match()?;
-                    self.write(&bytes[line.with_end(upto)])?;
-                    line = line.with_start(upto);
-                } else {
-                    let upto = cmp::min(line.end(), m.end());
-                    self.start_color_match()?;
-                    self.write(&bytes[line.with_end(upto)])?;
-                    line = line.with_start(upto);
-                }
-            }
-            self.end_color_match()?;
-            self.write_line_term()?;
         }
         Ok(())
     }
@@ -1051,12 +1056,8 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         let mut stepper = LineStep::new(line_term, 0, bytes.len());
         while let Some((start, end)) = stepper.next(bytes) {
             let mut line = Match::new(start, end);
-            if self.has_line_terminator(&bytes[line]) {
-                line = line.with_end(line.end() - 1);
-            }
-            if self.config().trim_ascii {
-                line = self.trim_ascii_prefix_range(bytes, line);
-            }
+            self.trim_line_terminator(bytes, &mut line);
+            self.trim_ascii_prefix(bytes, &mut line);
             while !line.is_empty() {
                 if matches[midx].end() <= line.start() {
                     if midx + 1 < matches.len() {
@@ -1079,14 +1080,19 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
                         Some(m.start() as u64 + 1),
                     )?;
 
-                    let buf = &bytes[line.with_end(upto)];
+                    let this_line = line.with_end(upto);
                     line = line.with_start(upto);
-                    if self.exceeds_max_columns(&buf) {
-                        self.write_exceeded_line()?;
-                        continue;
+                    if self.exceeds_max_columns(&bytes[this_line]) {
+                        self.write_exceeded_line(
+                            bytes,
+                            this_line,
+                            matches,
+                            &mut midx,
+                        )?;
+                    } else {
+                        self.write_spec(spec, &bytes[this_line])?;
+                        self.write_line_term()?;
                     }
-                    self.write_spec(spec, buf)?;
-                    self.write_line_term()?;
                 }
             }
             count += 1;
@@ -1099,7 +1105,6 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         let spec = self.config().colors.matched();
         let bytes = self.sunk.bytes();
         for &m in self.sunk.matches() {
-            let mut m = m;
             let mut count = 0;
             let mut stepper = LineStep::new(line_term, 0, bytes.len());
             while let Some((start, end)) = stepper.next(bytes) {
@@ -1117,15 +1122,11 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
                 )?;
                 count += 1;
                 if self.exceeds_max_columns(&bytes[line]) {
-                    self.write_exceeded_line()?;
+                    self.write_exceeded_line(bytes, line, &[m], &mut 0)?;
                     continue;
                 }
-                if self.has_line_terminator(&bytes[line]) {
-                    line = line.with_end(line.end() - 1);
-                }
-                if self.config().trim_ascii {
-                    line = self.trim_ascii_prefix_range(bytes, line);
-                }
+                self.trim_line_terminator(bytes, &mut line);
+                self.trim_ascii_prefix(bytes, &mut line);
 
                 while !line.is_empty() {
                     if m.end() <= line.start() {
@@ -1182,7 +1183,10 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         line: &[u8],
     ) -> io::Result<()> {
         if self.exceeds_max_columns(line) {
-            self.write_exceeded_line()?;
+            let range = Match::new(0, line.len());
+            self.write_exceeded_line(
+                line, range, self.sunk.matches(), &mut 0,
+            )?;
         } else {
             self.write_trim(line)?;
             if !self.has_line_terminator(line) {
@@ -1195,50 +1199,114 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
     fn write_colored_line(
         &self,
         matches: &[Match],
-        line: &[u8],
+        bytes: &[u8],
     ) -> io::Result<()> {
         // If we know we aren't going to emit color, then we can go faster.
         let spec = self.config().colors.matched();
         if !self.wtr().borrow().supports_color() || spec.is_none() {
-            return self.write_line(line);
-        }
-        if self.exceeds_max_columns(line) {
-            return self.write_exceeded_line();
+            return self.write_line(bytes);
         }
 
-        let mut last_written =
-            if !self.config().trim_ascii {
-                0
-            } else {
-                self.trim_ascii_prefix_range(
-                    line,
-                    Match::new(0, line.len()),
-                ).start()
-            };
-        for mut m in matches.iter().map(|&m| m) {
-            if last_written < m.start() {
+        let line = Match::new(0, bytes.len());
+        if self.exceeds_max_columns(bytes) {
+            self.write_exceeded_line(bytes, line, matches, &mut 0)
+        } else {
+            self.write_colored_matches(bytes, line, matches, &mut 0)?;
+            self.write_line_term()?;
+            Ok(())
+        }
+    }
+
+    /// Write the `line` portion of `bytes`, with appropriate coloring for
+    /// each `match`, starting at `match_index`.
+    ///
+    /// This accounts for trimming any whitespace prefix and will *never* print
+    /// a line terminator. If a match exceeds the range specified by `line`,
+    /// then only the part of the match within `line` (if any) is printed.
+    fn write_colored_matches(
+        &self,
+        bytes: &[u8],
+        mut line: Match,
+        matches: &[Match],
+        match_index: &mut usize,
+    ) -> io::Result<()> {
+        self.trim_line_terminator(bytes, &mut line);
+        self.trim_ascii_prefix(bytes, &mut line);
+        if matches.is_empty() {
+            self.write(&bytes[line])?;
+            return Ok(());
+        }
+        while !line.is_empty() {
+            if matches[*match_index].end() <= line.start() {
+                if *match_index + 1 < matches.len() {
+                    *match_index += 1;
+                    continue;
+                } else {
+                    self.end_color_match()?;
+                    self.write(&bytes[line])?;
+                    break;
+                }
+            }
+
+            let m = matches[*match_index];
+            if line.start() < m.start() {
+                let upto = cmp::min(line.end(), m.start());
                 self.end_color_match()?;
-                self.write(&line[last_written..m.start()])?;
-            } else if last_written < m.end() {
-                m = m.with_start(last_written);
+                self.write(&bytes[line.with_end(upto)])?;
+                line = line.with_start(upto);
             } else {
-                continue;
-            }
-            if !m.is_empty() {
+                let upto = cmp::min(line.end(), m.end());
                 self.start_color_match()?;
-                self.write(&line[m])?;
+                self.write(&bytes[line.with_end(upto)])?;
+                line = line.with_start(upto);
             }
-            last_written = m.end();
         }
         self.end_color_match()?;
-        self.write(&line[last_written..])?;
-        if !self.has_line_terminator(line) {
-            self.write_line_term()?;
-        }
         Ok(())
     }
 
-    fn write_exceeded_line(&self) -> io::Result<()> {
+    fn write_exceeded_line(
+        &self,
+        bytes: &[u8],
+        mut line: Match,
+        matches: &[Match],
+        match_index: &mut usize,
+    ) -> io::Result<()> {
+        if self.config().max_columns_preview {
+            let original = line;
+            let end = BStr::new(&bytes[line])
+                .grapheme_indices()
+                .map(|(_, end, _)| end)
+                .take(self.config().max_columns.unwrap_or(0) as usize)
+                .last()
+                .unwrap_or(0) + line.start();
+            line = line.with_end(end);
+            self.write_colored_matches(bytes, line, matches, match_index)?;
+
+            if matches.is_empty() {
+                self.write(b" [... omitted end of long line]")?;
+            } else {
+                let remaining = matches
+                    .iter()
+                    .filter(|m| {
+                        m.start() >= line.end() && m.start() < original.end()
+                    })
+                    .count();
+                let tense =
+                    if remaining == 1 {
+                        "match"
+                    } else {
+                        "matches"
+                    };
+                write!(
+                    self.wtr().borrow_mut(),
+                    " [... {} more {}]",
+                    remaining, tense,
+                )?;
+            }
+            self.write_line_term()?;
+            return Ok(());
+        }
         if self.sunk.original_matches().is_empty() {
             if self.is_context() {
                 self.write(b"[Omitted long context line]")?;
@@ -1310,6 +1378,38 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         }
         if self.config().heading {
             self.write_path_line()?;
+        }
+        Ok(())
+    }
+
+    fn write_binary_message(&self, offset: u64) -> io::Result<()> {
+        if self.sink.match_count == 0 {
+            return Ok(());
+        }
+
+        let bin = self.searcher.binary_detection();
+        if let Some(byte) = bin.quit_byte() {
+            self.write(b"WARNING: stopped searching binary file ")?;
+            if let Some(path) = self.path() {
+                self.write_spec(self.config().colors.path(), path.as_bytes())?;
+                self.write(b" ")?;
+            }
+            let remainder = format!(
+                "after match (found {:?} byte around offset {})\n",
+                BStr::new(&[byte]), offset,
+            );
+            self.write(remainder.as_bytes())?;
+        } else if let Some(byte) = bin.convert_byte() {
+            self.write(b"Binary file ")?;
+            if let Some(path) = self.path() {
+                self.write_spec(self.config().colors.path(), path.as_bytes())?;
+                self.write(b" ")?;
+            }
+            let remainder = format!(
+                "matches (found {:?} byte around offset {})\n",
+                BStr::new(&[byte]), offset,
+            );
+            self.write(remainder.as_bytes())?;
         }
         Ok(())
     }
@@ -1389,11 +1489,24 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         if !self.config().trim_ascii {
             return self.write(buf);
         }
-        self.write(self.trim_ascii_prefix(buf))
+        let mut range = Match::new(0, buf.len());
+        self.trim_ascii_prefix(buf, &mut range);
+        self.write(&buf[range])
     }
 
     fn write(&self, buf: &[u8]) -> io::Result<()> {
         self.wtr().borrow_mut().write_all(buf)
+    }
+
+    fn trim_line_terminator(&self, buf: &[u8], line: &mut Match) {
+        let lineterm = self.searcher.line_terminator();
+        if lineterm.is_suffix(&buf[*line]) {
+            let mut end = line.end() - 1;
+            if lineterm.is_crlf() && buf[end - 1] == b'\r' {
+                end -= 1;
+            }
+            *line = line.with_end(end);
+        }
     }
 
     fn has_line_terminator(&self, buf: &[u8]) -> bool {
@@ -1451,14 +1564,12 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
     ///
     /// This stops trimming a prefix as soon as it sees non-whitespace or a
     /// line terminator.
-    fn trim_ascii_prefix_range(&self, slice: &[u8], range: Match) -> Match {
-        trim_ascii_prefix_range(self.searcher.line_terminator(), slice, range)
-    }
-
-    /// Trim prefix ASCII spaces from the given slice and return the
-    /// corresponding sub-slice.
-    fn trim_ascii_prefix<'s>(&self, slice: &'s [u8]) -> &'s [u8] {
-        trim_ascii_prefix(self.searcher.line_terminator(), slice)
+    fn trim_ascii_prefix(&self, slice: &[u8], range: &mut Match) {
+        if !self.config().trim_ascii {
+            return;
+        }
+        let lineterm = self.searcher.line_terminator();
+        *range = trim_ascii_prefix(lineterm, slice, *range)
     }
 }
 
@@ -2226,6 +2337,31 @@ but Doctor Watson has to have it taken out for him and dusted,
     }
 
     #[test]
+    fn max_columns_preview() {
+        let matcher = RegexMatcher::new("exhibited|dusted").unwrap();
+        let mut printer = StandardBuilder::new()
+            .max_columns(Some(46))
+            .max_columns_preview(true)
+            .build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(
+                &matcher,
+                SHERLOCK.as_bytes(),
+                printer.sink(&matcher),
+            )
+            .unwrap();
+
+        let got = printer_contents(&mut printer);
+        let expected = "\
+but Doctor Watson has to have it taken out for [... omitted end of long line]
+and exhibited clearly, with a label attached.
+";
+        assert_eq_printed!(expected, got);
+    }
+
+    #[test]
     fn max_columns_with_count() {
         let matcher = RegexMatcher::new("cigar|ash|dusted").unwrap();
         let mut printer = StandardBuilder::new()
@@ -2251,6 +2387,86 @@ but Doctor Watson has to have it taken out for him and dusted,
     }
 
     #[test]
+    fn max_columns_with_count_preview_no_match() {
+        let matcher = RegexMatcher::new("exhibited|has to have it").unwrap();
+        let mut printer = StandardBuilder::new()
+            .stats(true)
+            .max_columns(Some(46))
+            .max_columns_preview(true)
+            .build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(
+                &matcher,
+                SHERLOCK.as_bytes(),
+                printer.sink(&matcher),
+            )
+            .unwrap();
+
+        let got = printer_contents(&mut printer);
+        let expected = "\
+but Doctor Watson has to have it taken out for [... 0 more matches]
+and exhibited clearly, with a label attached.
+";
+        assert_eq_printed!(expected, got);
+    }
+
+    #[test]
+    fn max_columns_with_count_preview_one_match() {
+        let matcher = RegexMatcher::new("exhibited|dusted").unwrap();
+        let mut printer = StandardBuilder::new()
+            .stats(true)
+            .max_columns(Some(46))
+            .max_columns_preview(true)
+            .build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(
+                &matcher,
+                SHERLOCK.as_bytes(),
+                printer.sink(&matcher),
+            )
+            .unwrap();
+
+        let got = printer_contents(&mut printer);
+        let expected = "\
+but Doctor Watson has to have it taken out for [... 1 more match]
+and exhibited clearly, with a label attached.
+";
+        assert_eq_printed!(expected, got);
+    }
+
+    #[test]
+    fn max_columns_with_count_preview_two_matches() {
+        let matcher = RegexMatcher::new(
+            "exhibited|dusted|has to have it",
+        ).unwrap();
+        let mut printer = StandardBuilder::new()
+            .stats(true)
+            .max_columns(Some(46))
+            .max_columns_preview(true)
+            .build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(
+                &matcher,
+                SHERLOCK.as_bytes(),
+                printer.sink(&matcher),
+            )
+            .unwrap();
+
+        let got = printer_contents(&mut printer);
+        let expected = "\
+but Doctor Watson has to have it taken out for [... 1 more match]
+and exhibited clearly, with a label attached.
+";
+        assert_eq_printed!(expected, got);
+    }
+
+    #[test]
     fn max_columns_multi_line() {
         let matcher = RegexMatcher::new("(?s)ash.+dusted").unwrap();
         let mut printer = StandardBuilder::new()
@@ -2271,6 +2487,36 @@ but Doctor Watson has to have it taken out for him and dusted,
         let expected = "\
 [Omitted long matching line]
 but Doctor Watson has to have it taken out for him and dusted,
+";
+        assert_eq_printed!(expected, got);
+    }
+
+    #[test]
+    fn max_columns_multi_line_preview() {
+        let matcher = RegexMatcher::new(
+            "(?s)clew|cigar ash.+have it|exhibited",
+        ).unwrap();
+        let mut printer = StandardBuilder::new()
+            .stats(true)
+            .max_columns(Some(46))
+            .max_columns_preview(true)
+            .build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .line_number(false)
+            .multi_line(true)
+            .build()
+            .search_reader(
+                &matcher,
+                SHERLOCK.as_bytes(),
+                printer.sink(&matcher),
+            )
+            .unwrap();
+
+        let got = printer_contents(&mut printer);
+        let expected = "\
+can extract a clew from a wisp of straw or a f [... 1 more match]
+but Doctor Watson has to have it taken out for [... 0 more matches]
+and exhibited clearly, with a label attached.
 ";
         assert_eq_printed!(expected, got);
     }
@@ -2565,7 +2811,39 @@ Holmeses, success in the province of detective work must always
     }
 
     #[test]
+    fn only_matching_max_columns_preview() {
+        let matcher = RegexMatcher::new("Doctor Watsons|Sherlock").unwrap();
+        let mut printer = StandardBuilder::new()
+            .only_matching(true)
+            .max_columns(Some(10))
+            .max_columns_preview(true)
+            .column(true)
+            .build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .line_number(true)
+            .build()
+            .search_reader(
+                &matcher,
+                SHERLOCK.as_bytes(),
+                printer.sink(&matcher),
+            )
+            .unwrap();
+
+        let got = printer_contents(&mut printer);
+        let expected = "\
+1:9:Doctor Wat [... 0 more matches]
+1:57:Sherlock
+3:49:Sherlock
+";
+        assert_eq_printed!(expected, got);
+    }
+
+    #[test]
     fn only_matching_max_columns_multi_line1() {
+        // The `(?s:.{0})` trick fools the matcher into thinking that it
+        // can match across multiple lines without actually doing so. This is
+        // so we can test multi-line handling in the case of a match on only
+        // one line.
         let matcher = RegexMatcher::new(
             r"(?s:.{0})(Doctor Watsons|Sherlock)"
         ).unwrap();
@@ -2588,6 +2866,41 @@ Holmeses, success in the province of detective work must always
         let got = printer_contents(&mut printer);
         let expected = "\
 1:9:[Omitted long matching line]
+1:57:Sherlock
+3:49:Sherlock
+";
+        assert_eq_printed!(expected, got);
+    }
+
+    #[test]
+    fn only_matching_max_columns_preview_multi_line1() {
+        // The `(?s:.{0})` trick fools the matcher into thinking that it
+        // can match across multiple lines without actually doing so. This is
+        // so we can test multi-line handling in the case of a match on only
+        // one line.
+        let matcher = RegexMatcher::new(
+            r"(?s:.{0})(Doctor Watsons|Sherlock)"
+        ).unwrap();
+        let mut printer = StandardBuilder::new()
+            .only_matching(true)
+            .max_columns(Some(10))
+            .max_columns_preview(true)
+            .column(true)
+            .build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .multi_line(true)
+            .line_number(true)
+            .build()
+            .search_reader(
+                &matcher,
+                SHERLOCK.as_bytes(),
+                printer.sink(&matcher),
+            )
+            .unwrap();
+
+        let got = printer_contents(&mut printer);
+        let expected = "\
+1:9:Doctor Wat [... 0 more matches]
 1:57:Sherlock
 3:49:Sherlock
 ";
@@ -2620,6 +2933,38 @@ Holmeses, success in the province of detective work must always
 1:16:Watsons of this world, as opposed to the Sherlock
 2:16:Holmeses
 5:12:[Omitted long matching line]
+6:12:and exhibited clearly
+";
+        assert_eq_printed!(expected, got);
+    }
+
+    #[test]
+    fn only_matching_max_columns_preview_multi_line2() {
+        let matcher = RegexMatcher::new(
+            r"(?s)Watson.+?(Holmeses|clearly)"
+        ).unwrap();
+        let mut printer = StandardBuilder::new()
+            .only_matching(true)
+            .max_columns(Some(50))
+            .max_columns_preview(true)
+            .column(true)
+            .build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .multi_line(true)
+            .line_number(true)
+            .build()
+            .search_reader(
+                &matcher,
+                SHERLOCK.as_bytes(),
+                printer.sink(&matcher),
+            )
+            .unwrap();
+
+        let got = printer_contents(&mut printer);
+        let expected = "\
+1:16:Watsons of this world, as opposed to the Sherlock
+2:16:Holmeses
+5:12:Watson has to have it taken out for him and dusted [... 0 more matches]
 6:12:and exhibited clearly
 ";
         assert_eq_printed!(expected, got);
@@ -2816,6 +3161,61 @@ Holmeses, success in the province of detective work must always
 1:[Omitted long line with 2 matches]
 3:be, to a very large extent, the result of luck. doctah  MD Holmes
 5:but doctah Watson MD has to have it taken out for him and dusted,
+";
+        assert_eq_printed!(expected, got);
+    }
+
+    #[test]
+    fn replacement_max_columns_preview1() {
+        let matcher = RegexMatcher::new(r"Sherlock|Doctor (\w+)").unwrap();
+        let mut printer = StandardBuilder::new()
+            .max_columns(Some(67))
+            .max_columns_preview(true)
+            .replacement(Some(b"doctah $1 MD".to_vec()))
+            .build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .line_number(true)
+            .build()
+            .search_reader(
+                &matcher,
+                SHERLOCK.as_bytes(),
+                printer.sink(&matcher),
+            )
+            .unwrap();
+
+        let got = printer_contents(&mut printer);
+        let expected = "\
+1:For the doctah Watsons MD of this world, as opposed to the doctah   [... 0 more matches]
+3:be, to a very large extent, the result of luck. doctah  MD Holmes
+5:but doctah Watson MD has to have it taken out for him and dusted,
+";
+        assert_eq_printed!(expected, got);
+    }
+
+    #[test]
+    fn replacement_max_columns_preview2() {
+        let matcher = RegexMatcher::new(
+            "exhibited|dusted|has to have it",
+        ).unwrap();
+        let mut printer = StandardBuilder::new()
+            .max_columns(Some(43))
+            .max_columns_preview(true)
+            .replacement(Some(b"xxx".to_vec()))
+            .build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(
+                &matcher,
+                SHERLOCK.as_bytes(),
+                printer.sink(&matcher),
+            )
+            .unwrap();
+
+        let got = printer_contents(&mut printer);
+        let expected = "\
+but Doctor Watson xxx taken out for him and [... 1 more match]
+and xxx clearly, with a label attached.
 ";
         assert_eq_printed!(expected, got);
     }

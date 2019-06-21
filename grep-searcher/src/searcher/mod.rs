@@ -75,24 +75,40 @@ impl BinaryDetection {
         BinaryDetection(line_buffer::BinaryDetection::Quit(binary_byte))
     }
 
-    // TODO(burntsushi): Figure out how to make binary conversion work. This
-    // permits implementing GNU grep's default behavior, which is to zap NUL
-    // bytes but still execute a search (if a match is detected, then GNU grep
-    // stops and reports that a match was found but doesn't print the matching
-    // line itself).
-    //
-    // This behavior is pretty simple to implement using the line buffer (and
-    // in fact, it is already implemented and tested), since there's a fixed
-    // size buffer that we can easily write to. The issue arises when searching
-    // a `&[u8]` (whether on the heap or via a memory map), since this isn't
-    // something we can easily write to.
-
-    /// The given byte is searched in all contents read by the line buffer. If
-    /// it occurs, then it is replaced by the line terminator. The line buffer
-    /// guarantees that this byte will never be observable by callers.
-    #[allow(dead_code)]
-    fn convert(binary_byte: u8) -> BinaryDetection {
+    /// Binary detection is performed by looking for the given byte, and
+    /// replacing it with the line terminator configured on the searcher.
+    /// (If the searcher is configured to use `CRLF` as the line terminator,
+    /// then this byte is replaced by just `LF`.)
+    ///
+    /// When searching is performed using a fixed size buffer, then the
+    /// contents of that buffer are always searched for the presence of this
+    /// byte and replaced with the line terminator. In effect, the caller is
+    /// guaranteed to never observe this byte while searching.
+    ///
+    /// When searching is performed with the entire contents mapped into
+    /// memory, then this setting has no effect and is ignored.
+    pub fn convert(binary_byte: u8) -> BinaryDetection {
         BinaryDetection(line_buffer::BinaryDetection::Convert(binary_byte))
+    }
+
+    /// If this binary detection uses the "quit" strategy, then this returns
+    /// the byte that will cause a search to quit. In any other case, this
+    /// returns `None`.
+    pub fn quit_byte(&self) -> Option<u8> {
+        match self.0 {
+            line_buffer::BinaryDetection::Quit(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// If this binary detection uses the "convert" strategy, then this returns
+    /// the byte that will be replaced by the line terminator. In any other
+    /// case, this returns `None`.
+    pub fn convert_byte(&self) -> Option<u8> {
+        match self.0 {
+            line_buffer::BinaryDetection::Convert(b) => Some(b),
+            _ => None,
+        }
     }
 }
 
@@ -155,6 +171,8 @@ pub struct Config {
     /// An encoding that, when present, causes the searcher to transcode all
     /// input from the encoding to UTF-8.
     encoding: Option<Encoding>,
+    /// Whether to do automatic transcoding based on a BOM or not.
+    bom_sniffing: bool,
 }
 
 impl Default for Config {
@@ -171,6 +189,7 @@ impl Default for Config {
             binary: BinaryDetection::default(),
             multi_line: false,
             encoding: None,
+            bom_sniffing: true,
         }
     }
 }
@@ -303,12 +322,15 @@ impl SearcherBuilder {
             config.before_context = 0;
             config.after_context = 0;
         }
+
         let mut decode_builder = DecodeReaderBytesBuilder::new();
         decode_builder
             .encoding(self.config.encoding.as_ref().map(|e| e.0))
             .utf8_passthru(true)
-            .strip_bom(true)
-            .bom_override(true);
+            .strip_bom(self.config.bom_sniffing)
+            .bom_override(true)
+            .bom_sniffing(self.config.bom_sniffing);
+
         Searcher {
             config: config,
             decode_builder: decode_builder,
@@ -506,17 +528,35 @@ impl SearcherBuilder {
     /// transcoding process encounters an error, then bytes are replaced with
     /// the Unicode replacement codepoint.
     ///
-    /// When no encoding is specified (the default), then BOM sniffing is used
-    /// to determine whether the source data is UTF-8 or UTF-16, and
-    /// transcoding will be performed automatically. If no BOM could be found,
-    /// then the source data is searched _as if_ it were UTF-8. However, so
-    /// long as the source data is at least ASCII compatible, then it is
-    /// possible for a search to produce useful results.
+    /// When no encoding is specified (the default), then BOM sniffing is
+    /// used (if it's enabled, which it is, by default) to determine whether
+    /// the source data is UTF-8 or UTF-16, and transcoding will be performed
+    /// automatically. If no BOM could be found, then the source data is
+    /// searched _as if_ it were UTF-8. However, so long as the source data is
+    /// at least ASCII compatible, then it is possible for a search to produce
+    /// useful results.
     pub fn encoding(
         &mut self,
         encoding: Option<Encoding>,
     ) -> &mut SearcherBuilder {
         self.config.encoding = encoding;
+        self
+    }
+
+    /// Enable automatic transcoding based on BOM sniffing.
+    ///
+    /// When this is enabled and an explicit encoding is not set, then this
+    /// searcher will try to detect the encoding of the bytes being searched
+    /// by sniffing its byte-order mark (BOM). In particular, when this is
+    /// enabled, UTF-16 encoded files will be searched seamlessly.
+    ///
+    /// When this is disabled and if an explicit encoding is not set, then
+    /// the bytes from the source stream will be passed through unchanged,
+    /// including its BOM, if one is present.
+    ///
+    /// This is enabled by default.
+    pub fn bom_sniffing(&mut self, yes: bool) -> &mut SearcherBuilder {
+        self.config.bom_sniffing = yes;
         self
     }
 }
@@ -715,6 +755,12 @@ impl Searcher {
         }
     }
 
+    /// Set the binary detection method used on this searcher.
+    pub fn set_binary_detection(&mut self, detection: BinaryDetection) {
+        self.config.binary = detection.clone();
+        self.line_buffer.borrow_mut().set_binary_detection(detection.0);
+    }
+
     /// Check that the searcher's configuration and the matcher are consistent
     /// with each other.
     fn check_config<M: Matcher>(&self, matcher: M) -> Result<(), ConfigError> {
@@ -738,7 +784,8 @@ impl Searcher {
 
     /// Returns true if and only if the given slice needs to be transcoded.
     fn slice_needs_transcoding(&self, slice: &[u8]) -> bool {
-        self.config.encoding.is_some() || slice_has_utf16_bom(slice)
+        self.config.encoding.is_some()
+        || (self.config.bom_sniffing && slice_has_utf16_bom(slice))
     }
 }
 
@@ -751,6 +798,12 @@ impl Searcher {
     #[inline]
     pub fn line_terminator(&self) -> LineTerminator {
         self.config.line_term
+    }
+
+    /// Returns the type of binary detection configured on this searcher.
+    #[inline]
+    pub fn binary_detection(&self) -> &BinaryDetection {
+        &self.config.binary
     }
 
     /// Returns true if and only if this searcher is configured to invert its

@@ -10,7 +10,7 @@ use grep::matcher::Matcher;
 use grep::pcre2::{RegexMatcher as PCRE2RegexMatcher};
 use grep::printer::{JSON, Standard, Summary, Stats};
 use grep::regex::{RegexMatcher as RustRegexMatcher};
-use grep::searcher::Searcher;
+use grep::searcher::{BinaryDetection, Searcher};
 use ignore::overrides::Override;
 use serde_json as json;
 use serde_json::json;
@@ -27,6 +27,8 @@ struct Config {
     preprocessor: Option<PathBuf>,
     preprocessor_globs: Override,
     search_zip: bool,
+    binary_implicit: BinaryDetection,
+    binary_explicit: BinaryDetection,
 }
 
 impl Default for Config {
@@ -36,6 +38,8 @@ impl Default for Config {
             preprocessor: None,
             preprocessor_globs: Override::empty(),
             search_zip: false,
+            binary_implicit: BinaryDetection::none(),
+            binary_explicit: BinaryDetection::none(),
         }
     }
 }
@@ -132,6 +136,37 @@ impl SearchWorkerBuilder {
     /// setting.
     pub fn search_zip(&mut self, yes: bool) -> &mut SearchWorkerBuilder {
         self.config.search_zip = yes;
+        self
+    }
+
+    /// Set the binary detection that should be used when searching files
+    /// found via a recursive directory search.
+    ///
+    /// Generally, this binary detection may be `BinaryDetection::quit` if
+    /// we want to skip binary files completely.
+    ///
+    /// By default, no binary detection is performed.
+    pub fn binary_detection_implicit(
+        &mut self,
+        detection: BinaryDetection,
+    ) -> &mut SearchWorkerBuilder {
+        self.config.binary_implicit = detection;
+        self
+    }
+
+    /// Set the binary detection that should be used when searching files
+    /// explicitly supplied by an end user.
+    ///
+    /// Generally, this binary detection should NOT be `BinaryDetection::quit`,
+    /// since we never want to automatically filter files supplied by the end
+    /// user.
+    ///
+    /// By default, no binary detection is performed.
+    pub fn binary_detection_explicit(
+        &mut self,
+        detection: BinaryDetection,
+    ) -> &mut SearchWorkerBuilder {
+        self.config.binary_explicit = detection;
         self
     }
 }
@@ -280,7 +315,24 @@ pub struct SearchWorker<W> {
 impl<W: WriteColor> SearchWorker<W> {
     /// Execute a search over the given subject.
     pub fn search(&mut self, subject: &Subject) -> io::Result<SearchResult> {
-        self.search_impl(subject)
+        let bin =
+            if subject.is_explicit() {
+                self.config.binary_explicit.clone()
+            } else {
+                self.config.binary_implicit.clone()
+            };
+        self.searcher.set_binary_detection(bin);
+
+        let path = subject.path();
+        if subject.is_stdin() {
+            self.search_reader(path, io::stdin().lock())
+        } else if self.should_preprocess(path) {
+            self.search_preprocessor(path)
+        } else if self.should_decompress(path) {
+            self.search_decompress(path)
+        } else {
+            self.search_path(path)
+        }
     }
 
     /// Return a mutable reference to the underlying printer.
@@ -303,22 +355,6 @@ impl<W: WriteColor> SearchWorker<W> {
             self.printer().print_stats_json(total_duration, stats)
         } else {
             self.printer().print_stats(total_duration, stats)
-        }
-    }
-
-    /// Search the given subject using the appropriate strategy.
-    fn search_impl(&mut self, subject: &Subject) -> io::Result<SearchResult> {
-        let path = subject.path();
-        if subject.is_stdin() {
-            let stdin = io::stdin();
-            // A `return` here appeases the borrow checker. NLL will fix this.
-            return self.search_reader(path, stdin.lock());
-        } else if self.should_preprocess(path) {
-            self.search_preprocessor(path)
-        } else if self.should_decompress(path) {
-            self.search_decompress(path)
-        } else {
-            self.search_path(path)
         }
     }
 
@@ -349,11 +385,23 @@ impl<W: WriteColor> SearchWorker<W> {
         &mut self,
         path: &Path,
     ) -> io::Result<SearchResult> {
-        let bin = self.config.preprocessor.clone().unwrap();
-        let mut cmd = Command::new(&bin);
+        let bin = self.config.preprocessor.as_ref().unwrap();
+        let mut cmd = Command::new(bin);
         cmd.arg(path).stdin(Stdio::from(File::open(path)?));
 
-        let rdr = self.command_builder.build(&mut cmd)?;
+        let rdr = self
+            .command_builder
+            .build(&mut cmd)
+            .map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "preprocessor command could not start: '{:?}': {}",
+                        cmd,
+                        err,
+                    ),
+                )
+            })?;
         self.search_reader(path, rdr).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::Other,

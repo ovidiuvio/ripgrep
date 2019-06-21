@@ -1,6 +1,6 @@
 [package]
 name = "grep-cli"
-version = "0.1.1"  #:version
+version = "0.1.2"  #:version
 authors = ["Andrew Gallant <jamslam@gmail.com>"]
 description = """
 Utilities for search oriented command line applications.
@@ -14,7 +14,8 @@ license = "Unlicense/MIT"
 
 [dependencies]
 atty = "0.2.11"
-globset = { version = "0.4.2", path = "../globset" }
+bstr = "0.1.2"
+globset = { version = "0.4.3", path = "../globset" }
 lazy_static = "1.1.0"
 log = "0.4.5"
 regex = "1.1"

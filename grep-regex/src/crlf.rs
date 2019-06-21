@@ -34,6 +34,11 @@ impl CRLFMatcher {
         }
         Ok(CRLFMatcher { regex, names })
     }
+
+    /// Return the underlying regex used by this matcher.
+    pub fn regex(&self) -> &Regex {
+        &self.regex
+    }
 }
 
 impl Matcher for CRLFMatcher {
@@ -71,7 +76,9 @@ impl Matcher for CRLFMatcher {
         caps: &mut RegexCaptures,
     ) -> Result<bool, NoError> {
         caps.strip_crlf(false);
-        let r = self.regex.captures_read_at(caps.locations(), haystack, at);
+        let r = self.regex.captures_read_at(
+            caps.locations_mut(), haystack, at,
+        );
         if !r.is_some() {
             return Ok(false);
         }

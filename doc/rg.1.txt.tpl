@@ -41,6 +41,9 @@ configuration file. The file can specify one shell argument per line. Lines
 starting with *#* are ignored. For more details, see the man page or the
 *README*.
 
+Tip: to disable all smart filtering and make ripgrep behave a bit more like
+classical grep, use *rg -uuu*.
+
 
 REGEX SYNTAX
 ------------
@@ -107,9 +110,9 @@ ripgrep supports reading configuration files that change ripgrep's default
 behavior. The format of the configuration file is an "rc" style and is very
 simple. It is defined by two rules:
 
-    1. Every line is a shell argument, after trimming ASCII whitespace.
+    1. Every line is a shell argument, after trimming whitespace.
     2. Lines starting with *#* (optionally preceded by any amount of
-       ASCII whitespace) are ignored.
+       whitespace) are ignored.
 
 ripgrep will look for a single configuration file if and only if the
 *RIPGREP_CONFIG_PATH* environment variable is set and is non-empty.
@@ -188,6 +191,21 @@ ripgrep may abort unexpectedly when using default settings if it searches a
 file that is simultaneously truncated. This behavior can be avoided by passing
 the *--no-mmap* flag which will forcefully disable the use of memory maps in
 all cases.
+
+ripgrep may use a large amount of memory depending on a few factors. Firstly,
+if ripgrep uses parallelism for search (the default), then the entire output
+for each individual file is buffered into memory in order to prevent
+interleaving matches in the output. To avoid this, you can disable parallelism
+with the *-j1* flag. Secondly, ripgrep always needs to have at least a single
+line in memory in order to execute a search. A file with a very long line can
+thus cause ripgrep to use a lot of memory. Generally, this only occurs when
+searching binary data with the *-a* flag enabled. (When the *-a* flag isn't
+enabled, ripgrep will replace all NUL bytes with line terminators, which
+typically prevents exorbitant memory usage.) Thirdly, when ripgrep searches
+a large file using a memory map, the process will report its resident memory
+usage as the size of the file. However, this does not mean ripgrep actually
+needed to use that much memory; the operating system will generally handle this
+for you.
 
 
 VERSION

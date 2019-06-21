@@ -1,3 +1,4 @@
+use std::error;
 use std::io::{self, Write};
 use std::process;
 use std::sync::{Arc, Mutex};
@@ -19,7 +20,30 @@ mod path_printer;
 mod search;
 mod subject;
 
-type Result<T> = ::std::result::Result<T, Box<::std::error::Error>>;
+// Since Rust no longer uses jemalloc by default, ripgrep will, by default,
+// use the system allocator. On Linux, this would normally be glibc's
+// allocator, which is pretty good. In particular, ripgrep does not have a
+// particularly allocation heavy workload, so there really isn't much
+// difference (for ripgrep's purposes) between glibc's allocator and jemalloc.
+//
+// However, when ripgrep is built with musl, this means ripgrep will use musl's
+// allocator, which appears to be substantially worse. (musl's goal is not to
+// have the fastest version of everything. Its goal is to be small and amenable
+// to static compilation.) Even though ripgrep isn't particularly allocation
+// heavy, musl's allocator appears to slow down ripgrep quite a bit. Therefore,
+// when building with musl, we use jemalloc.
+//
+// We don't unconditionally use jemalloc because it can be nice to use the
+// system's default allocator by default. Moreover, jemalloc seems to increase
+// compilation times by a bit.
+//
+// Moreover, we only do this on 64-bit systems since jemalloc doesn't support
+// i686.
+#[cfg(all(target_env = "musl", target_pointer_width = "64"))]
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
+type Result<T> = ::std::result::Result<T, Box<dyn error::Error>>;
 
 fn main() {
     if let Err(err) = Args::parse().and_then(try_main) {
@@ -39,6 +63,7 @@ fn try_main(args: Args) -> Result<()> {
             Files => files(&args),
             FilesParallel => files_parallel(&args),
             Types => types(&args),
+            PCRE2Version => pcre2_version(&args),
         }?;
     if matched && (args.quiet() || !messages::errored()) {
         process::exit(0)
@@ -274,4 +299,31 @@ fn types(args: &Args) -> Result<bool> {
         stdout.write_all(b"\n")?;
     }
     Ok(count > 0)
+}
+
+/// The top-level entry point for --pcre2-version.
+fn pcre2_version(args: &Args) -> Result<bool> {
+    #[cfg(feature = "pcre2")]
+    fn imp(args: &Args) -> Result<bool> {
+        use grep::pcre2;
+
+        let mut stdout = args.stdout();
+
+        let (major, minor) = pcre2::version();
+        writeln!(stdout, "PCRE2 {}.{} is available", major, minor)?;
+
+        if cfg!(target_pointer_width = "64") && pcre2::is_jit_available() {
+            writeln!(stdout, "JIT is available")?;
+        }
+        Ok(true)
+    }
+
+    #[cfg(not(feature = "pcre2"))]
+    fn imp(args: &Args) -> Result<bool> {
+        let mut stdout = args.stdout();
+        writeln!(stdout, "PCRE2 is not available in this build of ripgrep.")?;
+        Ok(false)
+    }
+
+    imp(args)
 }

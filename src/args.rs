@@ -73,6 +73,8 @@ pub enum Command {
     /// List all file type definitions configured, including the default file
     /// types and any additional file types added to the command line.
     Types,
+    /// Print the version of PCRE2 in use.
+    PCRE2Version,
 }
 
 impl Command {
@@ -82,7 +84,11 @@ impl Command {
 
         match *self {
             Search | SearchParallel => true,
-            SearchNever | Files | FilesParallel | Types => false,
+            | SearchNever
+            | Files
+            | FilesParallel
+            | Types
+            | PCRE2Version => false,
         }
     }
 }
@@ -235,7 +241,9 @@ impl Args {
         let threads = self.matches().threads()?;
         let one_thread = is_one_search || threads == 1;
 
-        Ok(if self.matches().is_present("type-list") {
+        Ok(if self.matches().is_present("pcre2-version") {
+            Command::PCRE2Version
+        } else if self.matches().is_present("type-list") {
             Command::Types
         } else if self.matches().is_present("files") {
             if one_thread {
@@ -286,15 +294,18 @@ impl Args {
         &self,
         wtr: W,
     ) -> Result<SearchWorker<W>> {
+        let matches = self.matches();
         let matcher = self.matcher().clone();
         let printer = self.printer(wtr)?;
-        let searcher = self.matches().searcher(self.paths())?;
+        let searcher = matches.searcher(self.paths())?;
         let mut builder = SearchWorkerBuilder::new();
         builder
-            .json_stats(self.matches().is_present("json"))
-            .preprocessor(self.matches().preprocessor())
-            .preprocessor_globs(self.matches().preprocessor_globs()?)
-            .search_zip(self.matches().is_present("search-zip"));
+            .json_stats(matches.is_present("json"))
+            .preprocessor(matches.preprocessor())
+            .preprocessor_globs(matches.preprocessor_globs()?)
+            .search_zip(matches.is_present("search-zip"))
+            .binary_detection_implicit(matches.binary_detection_implicit())
+            .binary_detection_explicit(matches.binary_detection_explicit());
         Ok(builder.build(matcher, searcher, printer))
     }
 
@@ -483,6 +494,37 @@ impl SortByKind {
     }
 }
 
+/// Encoding mode the searcher will use.
+#[derive(Clone, Debug)]
+enum EncodingMode {
+    /// Use an explicit encoding forcefully, but let BOM sniffing override it.
+    Some(Encoding),
+    /// Use only BOM sniffing to auto-detect an encoding.
+    Auto,
+    /// Use no explicit encoding and disable all BOM sniffing. This will
+    /// always result in searching the raw bytes, regardless of their
+    /// true encoding.
+    Disabled,
+}
+
+impl EncodingMode {
+    /// Checks if an explicit encoding has been set. Returns false for
+    /// automatic BOM sniffing and no sniffing.
+    ///
+    /// This is only used to determine whether PCRE2 needs to have its own
+    /// UTF-8 checking enabled. If we have an explicit encoding set, then
+    /// we're always guaranteed to get UTF-8, so we can disable PCRE2's check.
+    /// Otherwise, we have no such guarantee, and must enable PCRE2' UTF-8
+    /// check.
+    #[cfg(feature = "pcre2")]
+    fn has_explicit_encoding(&self) -> bool {
+        match self {
+            EncodingMode::Some(_) => true,
+            _ => false
+        }
+    }
+}
+
 impl ArgMatches {
     /// Create an ArgMatches from clap's parse result.
     fn new(clap_matches: clap::ArgMatches<'static>) -> ArgMatches {
@@ -557,6 +599,25 @@ impl ArgMatches {
         if self.is_present("pcre2") {
             let matcher = self.matcher_pcre2(patterns)?;
             Ok(PatternMatcher::PCRE2(matcher))
+        } else if self.is_present("auto-hybrid-regex") {
+            let rust_err = match self.matcher_rust(patterns) {
+                Ok(matcher) => return Ok(PatternMatcher::RustRegex(matcher)),
+                Err(err) => err,
+            };
+            log::debug!(
+                "error building Rust regex in hybrid mode:\n{}", rust_err,
+            );
+            let pcre_err = match self.matcher_pcre2(patterns) {
+                Ok(matcher) => return Ok(PatternMatcher::PCRE2(matcher)),
+                Err(err) => err,
+            };
+            Err(From::from(format!(
+                "regex could not be compiled with either the default regex \
+                 engine or with PCRE2.\n\n\
+                 default regex engine error:\n{}\n{}\n{}\n\n\
+                 PCRE2 regex engine error:\n{}",
+                 "~".repeat(79), rust_err, "~".repeat(79), pcre_err,
+            )))
         } else {
             let matcher = match self.matcher_rust(patterns) {
                 Ok(matcher) => matcher,
@@ -625,7 +686,13 @@ impl ArgMatches {
         if let Some(limit) = self.dfa_size_limit()? {
             builder.dfa_size_limit(limit);
         }
-        match builder.build(&patterns.join("|")) {
+        let res =
+            if self.is_present("fixed-strings") {
+                builder.build_literals(patterns)
+            } else {
+                builder.build(&patterns.join("|"))
+            };
+        match res {
             Ok(m) => Ok(m),
             Err(err) => Err(From::from(suggest_multiline(err.to_string()))),
         }
@@ -645,12 +712,17 @@ impl ArgMatches {
             .word(self.is_present("word-regexp"));
         // For whatever reason, the JIT craps out during regex compilation with
         // a "no more memory" error on 32 bit systems. So don't use it there.
-        if !cfg!(target_pointer_width = "32") {
-            builder.jit_if_available(true);
+        if cfg!(target_pointer_width = "64") {
+            builder
+                .jit_if_available(true)
+                // The PCRE2 docs say that 32KB is the default, and that 1MB
+                // should be big enough for anything. But let's crank it to
+                // 10MB.
+                .max_jit_stack_size(Some(10 * (1<<20)));
         }
         if self.pcre2_unicode() {
             builder.utf(true).ucp(true);
-            if self.encoding()?.is_some() {
+            if self.encoding()?.has_explicit_encoding() {
                 // SAFETY: If an encoding was specified, then we're guaranteed
                 // to get valid UTF-8, so we can disable PCRE2's UTF checking.
                 // (Feeding invalid UTF-8 to PCRE2 is undefined behavior.)
@@ -706,6 +778,7 @@ impl ArgMatches {
             .per_match(self.is_present("vimgrep"))
             .replacement(self.replacement())
             .max_columns(self.max_columns()?)
+            .max_columns_preview(self.max_columns_preview())
             .max_matches(self.max_count()?)
             .column(self.column())
             .byte_offset(self.is_present("byte-offset"))
@@ -765,9 +838,16 @@ impl ArgMatches {
             .before_context(ctx_before)
             .after_context(ctx_after)
             .passthru(self.is_present("passthru"))
-            .memory_map(self.mmap_choice(paths))
-            .binary_detection(self.binary_detection())
-            .encoding(self.encoding()?);
+            .memory_map(self.mmap_choice(paths));
+        match self.encoding()? {
+            EncodingMode::Some(enc) => {
+                builder.encoding(Some(enc));
+            }
+            EncodingMode::Auto => {} // default for the searcher
+            EncodingMode::Disabled => {
+                builder.bom_sniffing(false);
+            }
+        }
         Ok(builder.build())
     }
 
@@ -817,16 +897,39 @@ impl ArgMatches {
 ///
 /// Methods are sorted alphabetically.
 impl ArgMatches {
-    /// Returns the form of binary detection to perform.
-    fn binary_detection(&self) -> BinaryDetection {
+    /// Returns the form of binary detection to perform on files that are
+    /// implicitly searched via recursive directory traversal.
+    fn binary_detection_implicit(&self) -> BinaryDetection {
         let none =
             self.is_present("text")
-            || self.unrestricted_count() >= 3
+            || self.is_present("null-data");
+        let convert =
+            self.is_present("binary")
+            || self.unrestricted_count() >= 3;
+        if none {
+            BinaryDetection::none()
+        } else if convert {
+            BinaryDetection::convert(b'\x00')
+        } else {
+            BinaryDetection::quit(b'\x00')
+        }
+    }
+
+    /// Returns the form of binary detection to perform on files that are
+    /// explicitly searched via the user invoking ripgrep on a particular
+    /// file or files or stdin.
+    ///
+    /// In general, this should never be BinaryDetection::quit, since that acts
+    /// as a filter (but quitting immediately once a NUL byte is seen), and we
+    /// should never filter out files that the user wants to explicitly search.
+    fn binary_detection_explicit(&self) -> BinaryDetection {
+        let none =
+            self.is_present("text")
             || self.is_present("null-data");
         if none {
             BinaryDetection::none()
         } else {
-            BinaryDetection::quit(b'\x00')
+            BinaryDetection::convert(b'\x00')
         }
     }
 
@@ -952,24 +1055,30 @@ impl ArgMatches {
         u64_to_usize("dfa-size-limit", r)
     }
 
-    /// Returns the type of encoding to use.
+    /// Returns the encoding mode to use.
     ///
-    /// This only returns an encoding if one is explicitly specified. When no
-    /// encoding is present, the Searcher will still do BOM sniffing for UTF-16
-    /// and transcode seamlessly.
-    fn encoding(&self) -> Result<Option<Encoding>> {
+    /// This only returns an encoding if one is explicitly specified. Otherwise
+    /// if set to automatic, the Searcher will do BOM sniffing for UTF-16
+    /// and transcode seamlessly. If disabled, no BOM sniffing nor transcoding
+    /// will occur.
+    fn encoding(&self) -> Result<EncodingMode> {
         if self.is_present("no-encoding") {
-            return Ok(None);
+            return Ok(EncodingMode::Auto);
         }
+
         let label = match self.value_of_lossy("encoding") {
             None if self.pcre2_unicode() => "utf-8".to_string(),
-            None => return Ok(None),
+            None => return Ok(EncodingMode::Auto),
             Some(label) => label,
         };
+
         if label == "auto" {
-            return Ok(None);
+            return Ok(EncodingMode::Auto);
+        } else if label == "none" {
+            return Ok(EncodingMode::Disabled);
         }
-        Ok(Some(Encoding::new(&label)?))
+
+        Ok(EncodingMode::Some(Encoding::new(&label)?))
     }
 
     /// Return the file separator to use based on the CLI configuration.
@@ -1064,6 +1173,12 @@ impl ArgMatches {
     /// If `0` is provided, then this returns `None`.
     fn max_columns(&self) -> Result<Option<u64>> {
         Ok(self.usize_of_nonzero("max-columns")?.map(|n| n as u64))
+    }
+
+    /// Returns true if and only if a preview should be shown for lines that
+    /// exceed the maximum column limit.
+    fn max_columns_preview(&self) -> bool {
+        self.is_present("max-columns-preview")
     }
 
     /// The maximum number of matches permitted.
@@ -1195,7 +1310,8 @@ impl ArgMatches {
             !cli::is_readable_stdin()
             || (self.is_present("file") && file_is_stdin)
             || self.is_present("files")
-            || self.is_present("type-list");
+            || self.is_present("type-list")
+            || self.is_present("pcre2-version");
         if search_cwd {
             Path::new("./").to_path_buf()
         } else {
@@ -1654,12 +1770,12 @@ where I: IntoIterator<Item=T>,
     if err.use_stderr() {
         return Err(err.into());
     }
-    // Explicitly ignore any error returned by writeln!. The most likely error
+    // Explicitly ignore any error returned by write!. The most likely error
     // at this point is a broken pipe error, in which case, we want to ignore
     // it and exit quietly.
     //
     // (This is the point of this helper function. clap's functionality for
     // doing this will panic on a broken pipe error.)
-    let _ = writeln!(io::stdout(), "{}", err);
+    let _ = write!(io::stdout(), "{}", err);
     process::exit(0);
 }

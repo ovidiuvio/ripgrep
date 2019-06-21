@@ -11,6 +11,7 @@ and grep.
 [![Linux build status](https://travis-ci.org/BurntSushi/ripgrep.svg)](https://travis-ci.org/BurntSushi/ripgrep)
 [![Windows build status](https://ci.appveyor.com/api/projects/status/github/BurntSushi/ripgrep?svg=true)](https://ci.appveyor.com/project/BurntSushi/ripgrep)
 [![Crates.io](https://img.shields.io/crates/v/ripgrep.svg)](https://crates.io/crates/ripgrep)
+[![Packaging status](https://repology.org/badge/tiny-repos/ripgrep.svg)](https://repology.org/project/ripgrep/badges)
 
 Dual-licensed under MIT or the [UNLICENSE](http://unlicense.org).
 
@@ -107,13 +108,14 @@ increases the times to `2.640s` for ripgrep and `10.277s` for GNU grep.
 * ripgrep has optional support for switching its regex engine to use PCRE2.
   Among other things, this makes it possible to use look-around and
   backreferences in your patterns, which are not supported in ripgrep's default
-  regex engine. PCRE2 support is enabled with `-P`.
+  regex engine. PCRE2 support can be enabled with `-P/--pcre2` (use PCRE2
+  always) or `--auto-hybrid-regex` (use PCRE2 only if needed).
 * ripgrep supports searching files in text encodings other than UTF-8, such
   as UTF-16, latin-1, GBK, EUC-JP, Shift_JIS and more. (Some support for
   automatically detecting UTF-16 is provided. Other text encodings must be
   specifically specified with the `-E/--encoding` flag.)
-* ripgrep supports searching files compressed in a common format (gzip, xz,
-  lzma, bzip2 or lz4) with the `-z/--search-zip` flag.
+* ripgrep supports searching files compressed in a common format (brotli,
+  bzip2, gzip, lz4, lzma, xz, or zstandard) with the `-z/--search-zip` flag.
 * ripgrep supports arbitrary input preprocessing filters which could be PDF
   text extraction, less supported decompression, decrypting, automatic encoding
   detection and so on.
@@ -207,14 +209,6 @@ from homebrew-core, (compiled with rust stable, no SIMD):
 $ brew install ripgrep
 ```
 
-or you can install a binary compiled with rust nightly (including SIMD and all
-optimizations) by utilizing a custom tap:
-
-```
-$ brew tap burntsushi/ripgrep https://github.com/BurntSushi/ripgrep.git
-$ brew install ripgrep-bin
-```
-
 If you're a **MacPorts** user, then you can install ripgrep from the
 [official ports](https://www.macports.org/ports.php?by=name&substr=ripgrep):
 
@@ -293,8 +287,8 @@ then ripgrep can be installed using a binary `.deb` file provided in each
 [ripgrep release](https://github.com/BurntSushi/ripgrep/releases).
 
 ```
-$ curl -LO https://github.com/BurntSushi/ripgrep/releases/download/0.10.0/ripgrep_0.10.0_amd64.deb
-$ sudo dpkg -i ripgrep_0.10.0_amd64.deb
+$ curl -LO https://github.com/BurntSushi/ripgrep/releases/download/11.0.1/ripgrep_11.0.1_amd64.deb
+$ sudo dpkg -i ripgrep_11.0.1_amd64.deb
 ```
 
 If you run Debian Buster (currently Debian testing) or Debian sid, ripgrep is
@@ -339,7 +333,7 @@ If you're a **NetBSD** user, then you can install ripgrep from
 
 If you're a **Rust programmer**, ripgrep can be installed with `cargo`.
 
-* Note that the minimum supported version of Rust for ripgrep is **1.32.0**,
+* Note that the minimum supported version of Rust for ripgrep is **1.34.0**,
   although ripgrep may work with older versions.
 * Note that the binary may be bigger than expected because it contains debug
   symbols. This is intentional. To remove debug symbols and therefore reduce
@@ -349,18 +343,12 @@ If you're a **Rust programmer**, ripgrep can be installed with `cargo`.
 $ cargo install ripgrep
 ```
 
-When compiling with Rust 1.27 or newer, this will automatically enable SIMD
-optimizations for search.
-
-ripgrep isn't currently in any other package repositories.
-[I'd like to change that](https://github.com/BurntSushi/ripgrep/issues/10).
-
 
 ### Building
 
 ripgrep is written in Rust, so you'll need to grab a
 [Rust installation](https://www.rust-lang.org/) in order to compile it.
-ripgrep compiles with Rust 1.32.0 (stable) or newer. In general, ripgrep tracks
+ripgrep compiles with Rust 1.34.0 (stable) or newer. In general, ripgrep tracks
 the latest stable release of the Rust compiler.
 
 To build ripgrep:
